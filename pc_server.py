@@ -1,0 +1,984 @@
+"""
+PC Server — Smart Multi-Face Attendance System
+===============================================
+Main orchestrator running on the PC. Replaces pc_attendance_with_pir.py.
+
+Features:
+  - Fetches JPEG frames from ESP32-CAM via HTTP
+  - Multi-face detection (Haar Cascade) and recognition (LBPH)
+  - Attendance logging to Excel + CSV
+  - Serial communication with ESP32 Main Board
+  - Flask web dashboard on http://localhost:5000
+  - Enrollment mode support
+
+Requirements:
+  pip install opencv-contrib-python flask openpyxl pyserial requests numpy pillow
+
+Usage:
+  python pc_server.py
+"""
+
+import cv2
+import json
+import time
+import os
+import sys
+import threading
+import csv
+import numpy as np
+from datetime import datetime
+from collections import defaultdict
+
+# Optional imports — installed separately
+try:
+    import serial
+    import serial.tools.list_ports
+    SERIAL_AVAILABLE = True
+except ImportError:
+    print("[WARNING] pyserial not installed. ESP32 serial disabled.")
+    print("  Install: pip install pyserial")
+    SERIAL_AVAILABLE = False
+
+try:
+    import requests
+    REQUESTS_AVAILABLE = True
+except ImportError:
+    print("[WARNING] requests not installed. ESP32-CAM disabled, using local webcam.")
+    print("  Install: pip install requests")
+    REQUESTS_AVAILABLE = False
+
+try:
+    import openpyxl
+    from openpyxl import Workbook
+    OPENPYXL_AVAILABLE = True
+except ImportError:
+    print("[WARNING] openpyxl not installed. Excel logging disabled (CSV only).")
+    print("  Install: pip install openpyxl")
+    OPENPYXL_AVAILABLE = False
+
+try:
+    from flask import Flask, render_template_string, jsonify, request as flask_request
+    FLASK_AVAILABLE = True
+except ImportError:
+    print("[WARNING] Flask not installed. Web dashboard disabled.")
+    print("  Install: pip install flask")
+    FLASK_AVAILABLE = False
+
+
+# ─────────────────── CONFIGURATION ───────────────────
+
+# ESP32-CAM IP — update this after flashing the ESP32-CAM
+# The Arduino CameraWebServer serves on port 80 (default HTTP port)
+ESP32_CAM_IP = "10.56.216.13"  # Your ESP32-CAM's IP
+ESP32_CAM_URL = f"http://{ESP32_CAM_IP}/capture"
+
+# Files
+EXCEL_FILE = 'attendance_log.xlsx'
+CSV_FILE = 'attendance_log.csv'
+LABELS_FILE = 'labels.json'
+TRAINER_FILE = 'trainer.yml'
+DATASET_DIR = 'dataset'
+
+# Recognition settings
+CONFIDENCE_THRESHOLD = 80  # Lower = stricter matching (LBPH: 0=perfect, >100=bad)
+COOLDOWN_SECONDS = 30      # Don't re-log same person within this window
+SCAN_DURATION = 4          # Seconds to scan for faces
+MIN_DETECTIONS = 3         # Minimum frames a face must appear in to be logged
+CAPTURE_INTERVAL = 0.3     # Seconds between frame captures from ESP32-CAM
+
+# Flask dashboard
+FLASK_PORT = 5000
+
+# Display window
+SHOW_OPENCV_WINDOW = True  # Set False for headless operation
+
+
+# ─────────────────── GLOBAL STATE ───────────────────
+
+attendance_log = []     # In-memory attendance log for dashboard
+system_status = {
+    'mode': 'ATTENDANCE',
+    'last_scan': None,
+    'last_result': None,
+    'esp32_connected': False,
+    'camera_source': 'unknown',
+    'people_registered': 0,
+    'total_attendance': 0,
+}
+current_mode = 'ATTENDANCE'
+esp32_serial = None
+recognizer = None
+face_cascade = None
+id_to_name = {}
+last_logged = {}  # name → timestamp (cooldown tracking)
+
+
+# ─────────────────── ESP32 SERIAL ───────────────────
+
+def find_esp32():
+    """Auto-detect ESP32 COM port. Lists all candidates and tries each."""
+    if not SERIAL_AVAILABLE:
+        return None
+    candidates = []
+    ports = serial.tools.list_ports.comports()
+    print("  Available COM ports:")
+    for port in ports:
+        desc = port.description.upper()
+        print(f"    {port.device}: {port.description}")
+        if any(keyword in desc for keyword in ['USB', 'SERIAL', 'CH340', 'CP210', 'UART']):
+            candidates.append(port.device)
+    return candidates
+
+def connect_esp32():
+    """Connect to ESP32 via serial. Tries all candidate ports."""
+    global esp32_serial
+    candidates = find_esp32()
+    if not candidates:
+        print("[WARNING] No ESP32 COM ports found — running in PC-only mode")
+        print("  Manual trigger: press 'p' in the OpenCV window")
+        return False
+
+    for port in candidates:
+        try:
+            print(f"  Trying {port}...")
+            ser = serial.Serial(port, 115200, timeout=0.5)
+            time.sleep(1)
+            # Check if this port sends MicroPython data
+            ser.reset_input_buffer()
+            time.sleep(1)
+            if ser.in_waiting > 0:
+                data = ser.read(ser.in_waiting).decode(errors='ignore')
+                if any(kw in data for kw in ['MOTION', 'CALIBRAT', 'ATTENDANCE', 'BUTTON', 'MODE', 'PIR', 'RTC']):
+                    esp32_serial = ser
+                    system_status['esp32_connected'] = True
+                    print(f"[OK] ESP32 connected on {port}")
+                    return True
+            # Even if no data yet, use the first port
+            if esp32_serial is None:
+                esp32_serial = ser
+                system_status['esp32_connected'] = True
+                print(f"[OK] ESP32 connected on {port} (waiting for data)")
+                return True
+        except Exception as e:
+            print(f"    {port} failed: {e}")
+    print("[WARNING] Could not connect to ESP32 — running in PC-only mode")
+    print("  Manual trigger: press 'p' in the OpenCV window")
+    return False
+
+def send_to_esp32(message):
+    """Send a command to ESP32 over serial."""
+    if esp32_serial:
+        try:
+            esp32_serial.write((message + '\n').encode())
+        except Exception as e:
+            print(f"[SERIAL ERROR] {e}")
+
+def read_esp32():
+    """Non-blocking read from ESP32 serial. Returns line or None."""
+    if esp32_serial and esp32_serial.in_waiting > 0:
+        try:
+            line = esp32_serial.readline().decode().strip()
+            return line if line else None
+        except:
+            pass
+    return None
+
+
+# ─────────────────── CAMERA ───────────────────
+
+local_cam = None
+using_esp32_cam = False
+
+def init_camera():
+    """Initialize camera source (ESP32-CAM or local webcam)."""
+    global local_cam, using_esp32_cam
+
+    # Try ESP32-CAM with retries (it can take 15-20s to boot)
+    if REQUESTS_AVAILABLE:
+        for attempt in range(3):
+            try:
+                print(f"[CAMERA] Trying ESP32-CAM at {ESP32_CAM_URL}... (attempt {attempt+1}/3)")
+                resp = requests.get(ESP32_CAM_URL, timeout=8)
+                if resp.status_code == 200 and len(resp.content) > 1000:
+                    using_esp32_cam = True
+                    system_status['camera_source'] = f'ESP32-CAM ({ESP32_CAM_IP})'
+                    print(f"[OK] ESP32-CAM connected ({len(resp.content)} bytes)")
+                    return True
+                else:
+                    print(f"  Got status {resp.status_code}, {len(resp.content)} bytes — retrying...")
+            except Exception as e:
+                print(f"  Not reachable: {e}")
+            time.sleep(3)
+
+    # Fallback to local webcam
+    print("[CAMERA] ESP32-CAM unavailable. Falling back to local webcam...")
+    local_cam = cv2.VideoCapture(0)
+    if local_cam.isOpened():
+        system_status['camera_source'] = 'Local webcam'
+        print("[OK] Local webcam ready")
+        return True
+    else:
+        print("[ERROR] No camera available!")
+        return False
+
+def capture_frame():
+    """Capture a single frame. Returns (success, frame) tuple."""
+    if using_esp32_cam:
+        try:
+            resp = requests.get(ESP32_CAM_URL, timeout=5)
+            if resp.status_code == 200:
+                # Decode JPEG to OpenCV frame
+                img_array = np.frombuffer(resp.content, dtype=np.uint8)
+                frame = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+                if frame is not None:
+                    return True, frame
+        except Exception as e:
+            print(f"[CAPTURE ERROR] {e}")
+        return False, None
+    else:
+        if local_cam and local_cam.isOpened():
+            return local_cam.read()
+        return False, None
+
+
+# ─────────────────── FACE RECOGNITION ───────────────────
+
+def load_model():
+    """Load the LBPH face recognition model and labels."""
+    global recognizer, face_cascade, id_to_name
+
+    print("[MODEL] Loading facial recognition model...")
+
+    # Haar Cascade face detector
+    face_cascade = cv2.CascadeClassifier(
+        cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+    )
+
+    # LBPH face recognizer
+    recognizer = cv2.face.LBPHFaceRecognizer_create()
+
+    if os.path.exists(TRAINER_FILE):
+        recognizer.read(TRAINER_FILE)
+        print(f"[OK] Loaded model: {TRAINER_FILE}")
+    else:
+        print(f"[WARNING] Model file not found: {TRAINER_FILE}")
+        print("  Run: python train_faces.py")
+
+    # Load name labels
+    if os.path.exists(LABELS_FILE):
+        with open(LABELS_FILE, 'r') as f:
+            id_to_name = json.load(f)
+            id_to_name = {int(k): v for k, v in id_to_name.items()}
+        system_status['people_registered'] = len(id_to_name)
+        print(f"[OK] Loaded {len(id_to_name)} people: {list(id_to_name.values())}")
+    else:
+        print(f"[WARNING] Labels file not found: {LABELS_FILE}")
+
+def recognize_faces():
+    """
+    Run multi-face recognition over multiple frames.
+    Returns dict: {name: detection_count}
+    """
+    print("\n[SCANNING] Looking for faces...")
+    send_to_esp32("SCANNING")
+
+    detected_people = {}
+    face_history = defaultdict(list)
+    frames_captured = 0
+
+    start_time = time.time()
+    while time.time() - start_time < SCAN_DURATION:
+        ret, frame = capture_frame()
+        if not ret or frame is None:
+            time.sleep(CAPTURE_INTERVAL)
+            continue
+
+        frames_captured += 1
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+        # Detect all faces in this frame
+        faces = face_cascade.detectMultiScale(
+            gray,
+            scaleFactor=1.1,
+            minNeighbors=4,
+            minSize=(50, 50),
+            maxSize=(300, 300)
+        )
+
+        for (x, y, w, h) in faces:
+            face_roi = gray[y:y+h, x:x+w]
+            id_num, confidence = recognizer.predict(face_roi)
+
+            # Grid-based face tracking (same as scan.py approach)
+            face_key = f"{x // 50}_{y // 50}"
+
+            if confidence < CONFIDENCE_THRESHOLD and id_num in id_to_name:
+                face_history[face_key].append(id_num)
+                # Keep last 5 predictions
+                if len(face_history[face_key]) > 5:
+                    face_history[face_key].pop(0)
+
+                # Require at least 3 consistent predictions
+                if len(face_history[face_key]) >= MIN_DETECTIONS:
+                    most_common = max(set(face_history[face_key]),
+                                      key=face_history[face_key].count)
+                    name = id_to_name[most_common]
+                    if name not in detected_people:
+                        detected_people[name] = 0
+                    detected_people[name] += 1
+
+                    # Draw green box
+                    cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 255, 0), 2)
+                    conf_pct = int(100 - confidence)
+                    cv2.putText(frame, f"{name} ({conf_pct}%)", (x+5, y-10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                else:
+                    # Still detecting
+                    cv2.rectangle(frame, (x, y), (x+w, y+h), (255, 255, 0), 2)
+                    cv2.putText(frame, "Detecting...", (x+5, y-10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+            else:
+                # Unknown face
+                cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 0, 255), 2)
+                cv2.putText(frame, "Unknown", (x+5, y-10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                face_history[face_key] = []
+
+        # Show scan progress on frame
+        remaining = max(0, int(SCAN_DURATION - (time.time() - start_time)))
+        cv2.putText(frame, f"Scanning... {remaining}s | Faces: {len(faces)}",
+                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+        if SHOW_OPENCV_WINDOW:
+            cv2.imshow('Attendance System', frame)
+            cv2.waitKey(1)
+
+        time.sleep(CAPTURE_INTERVAL)
+
+    print(f"  Captured {frames_captured} frames")
+    return detected_people
+
+
+# ─────────────────── ATTENDANCE LOGGING ───────────────────
+
+def setup_logging():
+    """Set up Excel and CSV attendance log files."""
+    # CSV file
+    if not os.path.exists(CSV_FILE):
+        with open(CSV_FILE, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['Name', 'Date', 'Time', 'Status'])
+        print(f"[OK] Created {CSV_FILE}")
+
+    # Excel file
+    if OPENPYXL_AVAILABLE:
+        if not os.path.exists(EXCEL_FILE):
+            wb = Workbook()
+            ws = wb.active
+            ws.title = "Attendance"
+            ws.append(['Name', 'Date', 'Time', 'Status'])
+            wb.save(EXCEL_FILE)
+            print(f"[OK] Created {EXCEL_FILE}")
+        else:
+            print(f"[OK] Using existing {EXCEL_FILE}")
+
+    # Load existing CSV entries into memory for dashboard
+    if os.path.exists(CSV_FILE):
+        with open(CSV_FILE, 'r') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                attendance_log.append(row)
+        system_status['total_attendance'] = len(attendance_log)
+
+def log_attendance(name):
+    """Log attendance to CSV, Excel, and in-memory list."""
+    now = datetime.now()
+    date_str = now.strftime('%Y-%m-%d')
+    time_str = now.strftime('%H:%M:%S')
+
+    entry = {
+        'Name': name,
+        'Date': date_str,
+        'Time': time_str,
+        'Status': 'Present'
+    }
+
+    # CSV logging (always available)
+    try:
+        with open(CSV_FILE, 'a', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([name, date_str, time_str, 'Present'])
+    except Exception as e:
+        print(f"[CSV ERROR] {e}")
+
+    # Excel logging
+    if OPENPYXL_AVAILABLE:
+        try:
+            wb = openpyxl.load_workbook(EXCEL_FILE)
+            ws = wb.active
+            ws.append([name, date_str, time_str, 'Present'])
+            wb.save(EXCEL_FILE)
+        except Exception as e:
+            print(f"[EXCEL ERROR] {e}")
+
+    # In-memory log for dashboard
+    attendance_log.append(entry)
+    system_status['total_attendance'] = len(attendance_log)
+
+    print(f"  [LOGGED] {name} at {time_str}")
+    return True
+
+
+# ─────────────────── ENROLLMENT ───────────────────
+
+def enroll_face(person_name, num_samples=20):
+    """
+    Capture face samples for a new person from ESP32-CAM.
+    Saves images to dataset/<person_name>/ and retrains the model.
+    """
+    print(f"\n[ENROLL] Starting enrollment for: {person_name}")
+    send_to_esp32(f"ENROLL_START:{person_name}")
+
+    # Create directory
+    person_dir = os.path.join(DATASET_DIR, person_name)
+    os.makedirs(person_dir, exist_ok=True)
+
+    captured = 0
+    attempts = 0
+    max_attempts = num_samples * 5  # Allow some failed attempts
+
+    print(f"  Capturing {num_samples} face samples...")
+    print("  Please look at the camera and slowly turn your head.")
+
+    while captured < num_samples and attempts < max_attempts:
+        attempts += 1
+        ret, frame = capture_frame()
+        if not ret or frame is None:
+            time.sleep(0.3)
+            continue
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        faces = face_cascade.detectMultiScale(gray, 1.1, 4, minSize=(50, 50))
+
+        if len(faces) > 0:
+            # Take the largest face
+            largest = max(faces, key=lambda f: f[2] * f[3])
+            x, y, w, h = largest
+            face_roi = gray[y:y+h, x:x+w]
+
+            # Save face image
+            filename = os.path.join(person_dir, f"{person_name}_{captured+1:03d}.jpg")
+            cv2.imwrite(filename, face_roi)
+            captured += 1
+
+            progress = f"{captured}/{num_samples}"
+            send_to_esp32(f"ENROLL_PROGRESS:{progress}")
+            print(f"  Captured {progress}")
+
+            # Draw feedback on frame
+            cv2.rectangle(frame, (x, y), (x+w, y+h), (128, 0, 255), 2)
+            cv2.putText(frame, f"Enrolling: {progress}", (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (128, 0, 255), 2)
+        else:
+            cv2.putText(frame, "No face detected — look at camera", (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
+        if SHOW_OPENCV_WINDOW:
+            cv2.imshow('Enrollment', frame)
+            cv2.waitKey(1)
+
+        time.sleep(0.5)  # Half-second between captures for variation
+
+    if captured >= num_samples:
+        print(f"\n[ENROLL] Captured {captured} images. Retraining model...")
+        retrain_model()
+        send_to_esp32(f"ENROLL_DONE:{person_name}")
+        print(f"[ENROLL] Success! {person_name} enrolled.")
+        return True
+    else:
+        reason = f"Only captured {captured}/{num_samples} images"
+        send_to_esp32(f"ENROLL_FAIL:{reason}")
+        print(f"[ENROLL] Failed: {reason}")
+        return False
+
+def retrain_model():
+    """Retrain the LBPH model from all dataset images."""
+    from PIL import Image
+
+    print("[TRAIN] Retraining facial recognition model...")
+
+    detector = cv2.CascadeClassifier(
+        cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+    )
+
+    face_samples = []
+    ids = []
+    name_to_id = {}
+    current_id = 0
+
+    for root, dirs, files in os.walk(DATASET_DIR):
+        image_files = [f for f in files if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
+        if len(image_files) < 5:
+            continue
+
+        name = os.path.basename(root).strip()
+        if name == DATASET_DIR or not name:
+            continue
+
+        if name not in name_to_id:
+            name_to_id[name] = current_id
+            current_id += 1
+
+        actual_id = name_to_id[name]
+
+        for file in image_files:
+            img_path = os.path.join(root, file)
+            try:
+                pil_img = Image.open(img_path).convert('L')
+                img_numpy = np.array(pil_img, 'uint8')
+
+                faces = detector.detectMultiScale(img_numpy)
+                for (x, y, w, h) in faces:
+                    face_samples.append(img_numpy[y:y+h, x:x+w])
+                    ids.append(actual_id)
+            except Exception as e:
+                print(f"  [ERROR] {img_path}: {e}")
+
+    if len(face_samples) == 0:
+        print("[TRAIN] No face data found!")
+        return False
+
+    # Train LBPH
+    new_recognizer = cv2.face.LBPHFaceRecognizer_create()
+    new_recognizer.train(face_samples, np.array(ids))
+    new_recognizer.write(TRAINER_FILE)
+
+    # Save labels
+    new_id_to_name = {v: k for k, v in name_to_id.items()}
+    with open(LABELS_FILE, 'w') as f:
+        json.dump(new_id_to_name, f, indent=2)
+
+    # Reload into current session
+    global recognizer, id_to_name
+    recognizer.read(TRAINER_FILE)
+    id_to_name = {int(k): v for k, v in new_id_to_name.items()}
+    system_status['people_registered'] = len(id_to_name)
+
+    print(f"[TRAIN] Success! {len(face_samples)} samples from {len(name_to_id)} people")
+    for id_num, name in sorted(new_id_to_name.items()):
+        count = ids.count(id_num)
+        print(f"  ID {id_num}: {name} ({count} images)")
+
+    return True
+
+
+# ─────────────────── FLASK WEB DASHBOARD ───────────────────
+
+DASHBOARD_HTML = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Smart Attendance Dashboard</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Segoe UI', system-ui, sans-serif;
+            background: #0f0f23;
+            color: #e0e0e0;
+            min-height: 100vh;
+        }
+        .header {
+            background: linear-gradient(135deg, #1a1a3e 0%, #16213e 100%);
+            padding: 20px 30px;
+            border-bottom: 2px solid #00d4ff33;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .header h1 {
+            font-size: 1.5rem;
+            background: linear-gradient(135deg, #00d4ff, #7b68ee);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+        .status-badge {
+            padding: 6px 16px;
+            border-radius: 20px;
+            font-size: 0.85rem;
+            font-weight: 600;
+        }
+        .status-online { background: #00ff8833; color: #00ff88; border: 1px solid #00ff8855; }
+        .status-offline { background: #ff444433; color: #ff4444; border: 1px solid #ff444455; }
+        .container { padding: 20px 30px; display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 20px; }
+        .card {
+            background: #1a1a3e;
+            border-radius: 12px;
+            padding: 20px;
+            border: 1px solid #ffffff10;
+        }
+        .card h3 {
+            color: #00d4ff;
+            margin-bottom: 15px;
+            font-size: 0.95rem;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+        .stat-value {
+            font-size: 2.5rem;
+            font-weight: 700;
+            background: linear-gradient(135deg, #00d4ff, #7b68ee);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+        .stat-label { color: #888; font-size: 0.85rem; margin-top: 5px; }
+        .full-width { grid-column: 1 / -1; }
+        table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+        th {
+            background: #0f0f23;
+            padding: 10px 15px;
+            text-align: left;
+            color: #00d4ff;
+            font-size: 0.85rem;
+            text-transform: uppercase;
+        }
+        td { padding: 10px 15px; border-bottom: 1px solid #ffffff08; font-size: 0.9rem; }
+        tr:hover { background: #ffffff05; }
+        .name-tag {
+            background: #7b68ee22;
+            color: #7b68ee;
+            padding: 3px 10px;
+            border-radius: 12px;
+            font-size: 0.85rem;
+        }
+        .time-tag { color: #00ff88; font-family: 'Courier New', monospace; }
+        .btn {
+            padding: 10px 20px;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            font-weight: 600;
+            font-size: 0.9rem;
+            transition: all 0.2s;
+        }
+        .btn-primary {
+            background: linear-gradient(135deg, #00d4ff, #7b68ee);
+            color: white;
+        }
+        .btn-primary:hover { transform: translateY(-2px); box-shadow: 0 4px 15px #00d4ff33; }
+        .btn-danger { background: #ff4444; color: white; }
+        .actions { display: flex; gap: 10px; margin-top: 15px; }
+        .people-list { display: flex; flex-wrap: wrap; gap: 8px; }
+        .person-chip {
+            background: #00d4ff15;
+            border: 1px solid #00d4ff33;
+            color: #00d4ff;
+            padding: 6px 14px;
+            border-radius: 20px;
+            font-size: 0.85rem;
+        }
+        .mode-indicator {
+            padding: 4px 12px;
+            border-radius: 6px;
+            font-size: 0.8rem;
+            display: inline-block;
+        }
+        .mode-attend { background: #00ff8822; color: #00ff88; }
+        .mode-enroll { background: #7b68ee22; color: #7b68ee; }
+        @media (max-width: 768px) {
+            .container { grid-template-columns: 1fr; }
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>📋 Smart Attendance Dashboard</h1>
+        <span id="statusBadge" class="status-badge status-online">● System Active</span>
+    </div>
+    <div class="container">
+        <div class="card">
+            <h3>👥 Registered People</h3>
+            <div class="stat-value" id="registeredCount">-</div>
+            <div class="stat-label">enrolled faces</div>
+        </div>
+        <div class="card">
+            <h3>📊 Total Records</h3>
+            <div class="stat-value" id="totalRecords">-</div>
+            <div class="stat-label">attendance entries</div>
+        </div>
+        <div class="card">
+            <h3>🎯 System Mode</h3>
+            <div class="stat-value" id="systemMode">-</div>
+            <div class="stat-label" id="cameraSource">-</div>
+        </div>
+
+        <div class="card full-width">
+            <h3>👤 Enrolled People</h3>
+            <div class="people-list" id="peopleList"></div>
+        </div>
+
+        <div class="card full-width">
+            <h3>📋 Recent Attendance</h3>
+            <table>
+                <thead>
+                    <tr><th>#</th><th>Name</th><th>Date</th><th>Time</th><th>Status</th></tr>
+                </thead>
+                <tbody id="attendanceTable"></tbody>
+            </table>
+        </div>
+    </div>
+
+    <script>
+        function updateDashboard() {
+            fetch('/api/status')
+                .then(r => r.json())
+                .then(data => {
+                    document.getElementById('registeredCount').textContent = data.people_registered;
+                    document.getElementById('totalRecords').textContent = data.total_attendance;
+                    document.getElementById('systemMode').textContent = data.mode;
+                    document.getElementById('cameraSource').textContent = data.camera_source;
+                });
+            fetch('/api/attendance')
+                .then(r => r.json())
+                .then(data => {
+                    const tbody = document.getElementById('attendanceTable');
+                    tbody.innerHTML = '';
+                    data.slice(-50).reverse().forEach((entry, i) => {
+                        tbody.innerHTML += `<tr>
+                            <td>${data.length - i}</td>
+                            <td><span class="name-tag">${entry.Name}</span></td>
+                            <td>${entry.Date}</td>
+                            <td class="time-tag">${entry.Time}</td>
+                            <td>${entry.Status}</td>
+                        </tr>`;
+                    });
+                });
+            fetch('/api/people')
+                .then(r => r.json())
+                .then(data => {
+                    const list = document.getElementById('peopleList');
+                    list.innerHTML = data.map(n => `<span class="person-chip">${n}</span>`).join('');
+                });
+        }
+        updateDashboard();
+        setInterval(updateDashboard, 3000);
+    </script>
+</body>
+</html>
+"""
+
+def start_flask():
+    """Start Flask dashboard in a background thread."""
+    if not FLASK_AVAILABLE:
+        return
+
+    app = Flask(__name__)
+    app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 0
+
+    @app.route('/')
+    def dashboard():
+        return render_template_string(DASHBOARD_HTML)
+
+    @app.route('/api/status')
+    def api_status():
+        return jsonify(system_status)
+
+    @app.route('/api/attendance')
+    def api_attendance():
+        return jsonify(attendance_log)
+
+    @app.route('/api/people')
+    def api_people():
+        return jsonify(list(id_to_name.values()))
+
+    @app.route('/api/enroll', methods=['POST'])
+    def api_enroll():
+        data = flask_request.get_json()
+        name = data.get('name', '').strip()
+        if not name:
+            return jsonify({'error': 'Name required'}), 400
+        # Run enrollment in a thread
+        threading.Thread(target=enroll_face, args=(name,), daemon=True).start()
+        return jsonify({'status': 'Enrollment started', 'name': name})
+
+    @app.route('/api/trigger_scan', methods=['POST'])
+    def api_trigger_scan():
+        # This will be picked up by the main loop
+        return jsonify({'status': 'Scan triggered'})
+
+    # Run Flask without debug output
+    import logging
+    log = logging.getLogger('werkzeug')
+    log.setLevel(logging.WARNING)
+
+    print(f"\n[DASHBOARD] Web dashboard: http://localhost:{FLASK_PORT}")
+    app.run(host='0.0.0.0', port=FLASK_PORT, debug=False, use_reloader=False)
+
+
+# ─────────────────── MAIN SYSTEM ───────────────────
+
+def main():
+    global current_mode
+
+    print("\n" + "=" * 60)
+    print("  SMART MULTI-FACE ATTENDANCE SYSTEM")
+    print("  PC Server v2.0")
+    print("=" * 60)
+
+    # Step 1: Load face recognition model
+    print("\n[1/4] Loading facial recognition model...")
+    load_model()
+
+    # Step 2: Connect to ESP32
+    print("\n[2/4] Connecting to ESP32 main board...")
+    connect_esp32()
+
+    # Step 3: Initialize camera
+    print("\n[3/4] Initializing camera...")
+    if not init_camera():
+        print("[FATAL] No camera available. Exiting.")
+        return
+
+    # Step 4: Set up logging
+    print("\n[4/4] Setting up attendance logging...")
+    setup_logging()
+
+    # Start Flask dashboard in background
+    flask_thread = threading.Thread(target=start_flask, daemon=True)
+    flask_thread.start()
+
+    # Ready!
+    print("\n" + "=" * 60)
+    print("  SYSTEM ACTIVE")
+    print("=" * 60)
+    print(f"  Mode:     {current_mode}")
+    print(f"  Camera:   {system_status['camera_source']}")
+    print(f"  ESP32:    {'Connected' if esp32_serial else 'Not connected'}")
+    print(f"  People:   {list(id_to_name.values())}")
+    if FLASK_AVAILABLE:
+        print(f"  Dashboard: http://localhost:{FLASK_PORT}")
+    print("=" * 60)
+    print("\nWaiting for PIR motion detection...")
+    if not esp32_serial:
+        print("[INFO] Press 'p' in the OpenCV window to manually trigger scan")
+        print("[INFO] Press 'e' to enter enrollment mode")
+    print("Press 'q' to quit\n")
+
+    scanning = False
+
+    while True:
+        # ─── Check ESP32 serial messages ───
+        msg = read_esp32()
+        if msg:
+            if msg == "MOTION_DETECTED" and current_mode == 'ATTENDANCE':
+                print("\n[PIR] Motion detected!")
+                scanning = True
+            elif msg == "MODE_ENROLL":
+                current_mode = 'ENROLLMENT'
+                system_status['mode'] = 'ENROLLMENT'
+                print("\n[MODE] Switched to ENROLLMENT mode")
+                # Prompt for name on PC
+                print("Enter name for enrollment (or type 'cancel'):")
+                name = input("> ").strip()
+                if name and name.lower() != 'cancel':
+                    enroll_face(name)
+                current_mode = 'ATTENDANCE'
+                system_status['mode'] = 'ATTENDANCE'
+            elif msg == "MODE_ATTEND":
+                current_mode = 'ATTENDANCE'
+                system_status['mode'] = 'ATTENDANCE'
+                print("\n[MODE] Switched to ATTENDANCE mode")
+            elif msg.startswith("RTC:"):
+                print(f"  [RTC] {msg[4:]}")
+            elif msg == "BUTTON_PRESS":
+                if current_mode == 'ATTENDANCE':
+                    print("\n[BUTTON] Manual trigger!")
+                    scanning = True
+
+        # ─── Check keyboard in OpenCV window ───
+        if SHOW_OPENCV_WINDOW:
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('p'):
+                print("\n[MANUAL] Scan triggered!")
+                scanning = True
+            elif key == ord('e'):
+                current_mode = 'ENROLLMENT'
+                system_status['mode'] = 'ENROLLMENT'
+                print("\n[MANUAL] Enrollment mode")
+                print("Enter name for enrollment (or type 'cancel'):")
+                name = input("> ").strip()
+                if name and name.lower() != 'cancel':
+                    enroll_face(name)
+                current_mode = 'ATTENDANCE'
+                system_status['mode'] = 'ATTENDANCE'
+            elif key == ord('q'):
+                break
+
+        # ─── Run face recognition scan ───
+        if scanning and current_mode == 'ATTENDANCE':
+            detected = recognize_faces()
+
+            if detected:
+                names_list = list(detected.keys())
+                count = len(names_list)
+                print(f"\n[DETECTED] {count} people: {names_list}")
+
+                system_status['last_scan'] = datetime.now().strftime('%H:%M:%S')
+                system_status['last_result'] = names_list
+
+                # Log each person (with cooldown)
+                current_time = time.time()
+                logged_names = []
+                for name, det_count in detected.items():
+                    if name not in last_logged or \
+                       (current_time - last_logged[name]) > COOLDOWN_SECONDS:
+                        log_attendance(name)
+                        last_logged[name] = current_time
+                        logged_names.append(name)
+                    else:
+                        remaining = int(COOLDOWN_SECONDS - (current_time - last_logged[name]))
+                        print(f"  [COOLDOWN] {name} — wait {remaining}s")
+
+                # Send results to ESP32
+                if logged_names:
+                    names_str = ",".join(logged_names)
+                    send_to_esp32(f"RESULT:{len(logged_names)}:{names_str}")
+                else:
+                    send_to_esp32("RESULT:0:")
+            else:
+                print("\n[WARNING] No faces recognized")
+                send_to_esp32("NO_FACES")
+
+            scanning = False
+            print("\n[READY] Waiting for next motion event...")
+            time.sleep(2)
+
+        # ─── Show live feed when idle ───
+        if not scanning and SHOW_OPENCV_WINDOW:
+            ret, frame = capture_frame()
+            if ret and frame is not None:
+                status_text = f"Mode: {current_mode} | Waiting for motion..."
+                cv2.putText(frame, status_text, (10, 30),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+                # Show registered people count
+                cv2.putText(frame, f"Registered: {len(id_to_name)} people",
+                            (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+
+                cv2.imshow('Attendance System', frame)
+
+        time.sleep(0.05)  # Small delay to prevent CPU spinning
+
+    # ─── Cleanup ───
+    print("\n[SHUTDOWN] Stopping system...")
+    if esp32_serial:
+        esp32_serial.close()
+    if local_cam:
+        local_cam.release()
+    cv2.destroyAllWindows()
+    print("[OK] System stopped")
+
+
+if __name__ == '__main__':
+    main()

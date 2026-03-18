@@ -80,10 +80,10 @@ TRAINER_FILE = 'trainer.yml'
 DATASET_DIR = 'dataset'
 
 # Recognition settings
-CONFIDENCE_THRESHOLD = 80  # Lower = stricter matching (LBPH: 0=perfect, >100=bad)
+CONFIDENCE_THRESHOLD = 145 # Lower = stricter matching. Increased to 145 to support smaller faces when multiple people stand further back.
 COOLDOWN_SECONDS = 30      # Don't re-log same person within this window
 SCAN_DURATION = 4          # Seconds to scan for faces
-MIN_DETECTIONS = 3         # Minimum frames a face must appear in to be logged
+MIN_DETECTIONS = 2         # Minimum frames a face must appear in to be logged
 CAPTURE_INTERVAL = 0.3     # Seconds between frame captures from ESP32-CAM
 
 # Flask dashboard
@@ -175,12 +175,13 @@ def send_to_esp32(message):
 
 def read_esp32():
     """Non-blocking read from ESP32 serial. Returns line or None."""
-    if esp32_serial and esp32_serial.in_waiting > 0:
-        try:
+    try:
+        if esp32_serial and esp32_serial.in_waiting > 0:
             line = esp32_serial.readline().decode().strip()
             return line if line else None
-        except:
-            pass
+    except Exception as e:
+        # Ignore serial dropouts or permission errors momentarily
+        pass
     return None
 
 
@@ -283,7 +284,7 @@ def recognize_faces():
     send_to_esp32("SCANNING")
 
     detected_people = {}
-    face_history = defaultdict(list)
+    person_counts = defaultdict(int)
     frames_captured = 0
 
     start_time = time.time()
@@ -308,41 +309,26 @@ def recognize_faces():
         for (x, y, w, h) in faces:
             face_roi = gray[y:y+h, x:x+w]
             id_num, confidence = recognizer.predict(face_roi)
+            
+            # Print debug info to figure out what values we are getting
+            guessed_name = id_to_name.get(id_num, "Unknown")
+            print(f"    [DEBUG] Face detected at ({x},{y}). Best match: {guessed_name}. Distance (Confidence): {confidence:.1f}")
 
-            # Grid-based face tracking (same as scan.py approach)
-            face_key = f"{x // 50}_{y // 50}"
-
+            # Simple tracking: If confidence is good, count the person
             if confidence < CONFIDENCE_THRESHOLD and id_num in id_to_name:
-                face_history[face_key].append(id_num)
-                # Keep last 5 predictions
-                if len(face_history[face_key]) > 5:
-                    face_history[face_key].pop(0)
-
-                # Require at least 3 consistent predictions
-                if len(face_history[face_key]) >= MIN_DETECTIONS:
-                    most_common = max(set(face_history[face_key]),
-                                      key=face_history[face_key].count)
-                    name = id_to_name[most_common]
-                    if name not in detected_people:
-                        detected_people[name] = 0
-                    detected_people[name] += 1
-
-                    # Draw green box
-                    cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 255, 0), 2)
-                    conf_pct = int(100 - confidence)
-                    cv2.putText(frame, f"{name} ({conf_pct}%)", (x+5, y-10),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-                else:
-                    # Still detecting
-                    cv2.rectangle(frame, (x, y), (x+w, y+h), (255, 255, 0), 2)
-                    cv2.putText(frame, "Detecting...", (x+5, y-10),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+                name = id_to_name[id_num]
+                person_counts[name] += 1
+                
+                # Draw green box
+                cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 255, 0), 2)
+                conf_pct = int(100 - min(confidence, 100))
+                cv2.putText(frame, f"{name} ({conf_pct}%)", (x+5, y-10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
             else:
                 # Unknown face
                 cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 0, 255), 2)
-                cv2.putText(frame, "Unknown", (x+5, y-10),
+                cv2.putText(frame, f"Unknown ({int(confidence)})", (x+5, y-10),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-                face_history[face_key] = []
 
         # Show scan progress on frame
         remaining = max(0, int(SCAN_DURATION - (time.time() - start_time)))
@@ -355,7 +341,12 @@ def recognize_faces():
 
         time.sleep(CAPTURE_INTERVAL)
 
-    print(f"  Captured {frames_captured} frames")
+    # Filter out people who didn't meet MIN_DETECTIONS
+    for name, count in person_counts.items():
+        if count >= MIN_DETECTIONS:
+            detected_people[name] = count
+
+    print(f"  Captured {frames_captured} frames. Raw Detections: {dict(person_counts)}")
     return detected_people
 
 
@@ -387,7 +378,11 @@ def setup_logging():
         with open(CSV_FILE, 'r') as f:
             reader = csv.DictReader(f)
             for row in reader:
-                attendance_log.append(row)
+                # Clean row to prevent JSON serialization errors (e.g. None keys)
+                clean_row = {str(k): str(v) if v is not None else "" for k, v in row.items() if k is not None}
+                # Only append valid rows
+                if clean_row.get('Name') and str(clean_row.get('Name')).strip():
+                    attendance_log.append(clean_row)
         system_status['total_attendance'] = len(attendance_log)
 
 def log_attendance(name):

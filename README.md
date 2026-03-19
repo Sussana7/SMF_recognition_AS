@@ -1,49 +1,48 @@
-# Smart Multi-Face Attendance System
+# Smart Multi-Face Recognition Attendance System
 
-ESP32-based attendance system with facial recognition using LBPH algorithm.
+A comprehensive, edge-to-cloud IoT attendance tracking system using ESP32 microcontrollers, OpenCV facial recognition, and a live Flask Web Dashboard.
 
-## Files
+## Features
+- **Multi-Face Recognition**: Uses OpenCV and LBPH (Local Binary Patterns Histograms) to recognize multiple people simultaneously in a single frame.
+- **Hardware Integration**: ESP32 main board equipped with a PIR sensor, Push Button, TFT display (ST7735), Buzzer, and RGB LED for physical interactions and status updates.
+- **ESP32-CAM Video Stream**: Uses a dedicated ESP32-CAM module to securely stream JPEG frames over Wi-Fi to a PC server for heavy processing.
+- **Live Web Dashboard**: A responsive, real-time dashboard built with Flask and TailwindCSS that allows administrators to view logs, monitor system status, and trigger remote enrollments directly from a web browser.
+- **Automated Fallback**: The system automatically gracefully degrades to use the **PC's internal webcam** if the ESP32-CAM is unavailable or encounters Wi-Fi issues.
 
-### PC Files (Python):
-- `train_faces.py` - Train facial recognition model
-- `pc_attendance_with_pir.py` - PC program (uses webcam)
-- `scan.py` - Standalone scanning script
+## Testing & Evaluation without Hardware (For Examiners)
+The project is built to ensure a flawless software evaluation even if the physical hardware is disconnected or unavailable.
 
-### ESP32 Files (MicroPython):
-- `esp32_main_board.py` - Upload to ESP32 Main Board as `main.py`
-- `esp32_cam_server.py` - Upload to ESP32-CAM as `main.py`
+If you run the system without being on the specific ESP32 Wi-Fi network:
+1. The script will attempt to connect to the ESP32-CAM for 3 attempts.
+2. If unreachable, it will gracefully output: `[CAMERA] ESP32-CAM unavailable. Falling back to local webcam...`
+3. The system will activate your PC's built-in webcam instead. 
+4. You can continue to use all features: pressing 'p' on the keyboard to simulate PIR motion scans, clicking "Start Face Scan" on the Local Web Dashboard (`http://localhost:5000`) for remote enrollment, and viewing live attendance logs across CSV and the Dashboard exactly as if the hardware was present!
 
-### Data Files:
-- `trainer.yml` - Trained LBPH model
-- `labels.json` - Name mappings
-- `attendance_log.xlsx` - Attendance records
-- `dataset/` - Training images (5+ per person)
+## Software Installation
+1. Install Python 3.9+
+2. Install the necessary pip packages:
+   ```bash
+   pip install opencv-contrib-python requests pyserial flask openpyxl
+   ```
+3. Run the PC Server:
+   ```bash
+   python pc_server.py
+   ```
+4. Access the Live Dashboard:
+   Open a web browser and navigate to `http://localhost:5000`
 
-## Hardware Setup
+## Hardware Deployment (ESP32)
+1. **ESP32-CAM**: Flashed with standard AI Thinker Camera Web Server sketch. Note the IP address and update `ESP32_CAM_URL` in `pc_server.py`.
+2. **ESP32 Main Board**: Flash `esp32_main_board.py` using MicroPython via Thonny. Uses `machine.Pin.irq()` hardware interrupts for zero-latency interactions.
 
-### ESP32 Main Board:
-- PIR Sensor → GPIO 13
-- Buzzer → GPIO 14
-- USB → PC
+### Pin Configurations (ESP32)
+- PIR Sensor: GPIO 13
+- Push Button: GPIO 27
+- TFT (ST7735): SCK=18, MOSI=23, CS=5, DC=2, RST=4
+- RGB LED: R=25, G=26, B=33
+- Buzzer: GPIO 14
+- RTC (I2C): SDA=21, SCL=22
 
-### ESP32-CAM:
-- Connect to WiFi
-- Update credentials in `esp32_cam_server.py` (lines 8-9)
-
-## Usage
-
-1. Train model: `python train_faces.py`
-2. Upload `esp32_main_board.py` to ESP32 Main as `main.py`
-3. Upload `esp32_cam_server.py` to ESP32-CAM as `main.py`
-4. Update ESP32-CAM IP in PC code
-5. Run: `python pc_attendance_with_pir.py`
-```
-
----
-
-## **📋 CREATE `.gitignore` FILE:**
-```
-__pycache__/
-*.pyc
-.vscode/
-*.log
+## System Workflows
+- **Attendance Mode**: System idles until motion is detected or 'p' is pressed. It scans for 4 seconds, identifies all faces, outputs feedback (Buzzer/LED), and appends logs to CSV (`attendance_log.csv`).
+- **Enrollment Mode**: Can be triggered structurally via the physical Push Button or remotely through the Web Dashboard. It gathers 20 continuous face frames, updates the dynamic LBPH model on-the-fly (`trainer.yml`), and saves the new identity.

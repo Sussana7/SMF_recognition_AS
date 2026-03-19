@@ -25,6 +25,7 @@ import os
 import sys
 import threading
 import csv
+import queue
 import numpy as np
 from datetime import datetime
 from collections import defaultdict
@@ -57,12 +58,12 @@ except ImportError:
     OPENPYXL_AVAILABLE = False
 
 try:
-    from flask import Flask, render_template_string, jsonify, request as flask_request
+    from flask import Flask, jsonify, render_template, request
     FLASK_AVAILABLE = True
 except ImportError:
+    FLASK_AVAILABLE = False
     print("[WARNING] Flask not installed. Web dashboard disabled.")
     print("  Install: pip install flask")
-    FLASK_AVAILABLE = False
 
 
 # ─────────────────── CONFIGURATION ───────────────────
@@ -111,6 +112,7 @@ recognizer = None
 face_cascade = None
 id_to_name = {}
 last_logged = {}  # name → timestamp (cooldown tracking)
+enrollment_queue = queue.Queue()
 
 
 # ─────────────────── ESP32 SERIAL ───────────────────
@@ -226,7 +228,7 @@ def capture_frame():
     """Capture a single frame. Returns (success, frame) tuple."""
     if using_esp32_cam:
         try:
-            resp = requests.get(ESP32_CAM_URL, timeout=5)
+            resp = requests.get(ESP32_CAM_URL, timeout=1.0)
             if resp.status_code == 200:
                 # Decode JPEG to OpenCV frame
                 img_array = np.frombuffer(resp.content, dtype=np.uint8)
@@ -569,200 +571,6 @@ def retrain_model():
 
 # ─────────────────── FLASK WEB DASHBOARD ───────────────────
 
-DASHBOARD_HTML = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Smart Attendance Dashboard</title>
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body {
-            font-family: 'Segoe UI', system-ui, sans-serif;
-            background: #0f0f23;
-            color: #e0e0e0;
-            min-height: 100vh;
-        }
-        .header {
-            background: linear-gradient(135deg, #1a1a3e 0%, #16213e 100%);
-            padding: 20px 30px;
-            border-bottom: 2px solid #00d4ff33;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-        }
-        .header h1 {
-            font-size: 1.5rem;
-            background: linear-gradient(135deg, #00d4ff, #7b68ee);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-        }
-        .status-badge {
-            padding: 6px 16px;
-            border-radius: 20px;
-            font-size: 0.85rem;
-            font-weight: 600;
-        }
-        .status-online { background: #00ff8833; color: #00ff88; border: 1px solid #00ff8855; }
-        .status-offline { background: #ff444433; color: #ff4444; border: 1px solid #ff444455; }
-        .container { padding: 20px 30px; display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 20px; }
-        .card {
-            background: #1a1a3e;
-            border-radius: 12px;
-            padding: 20px;
-            border: 1px solid #ffffff10;
-        }
-        .card h3 {
-            color: #00d4ff;
-            margin-bottom: 15px;
-            font-size: 0.95rem;
-            text-transform: uppercase;
-            letter-spacing: 1px;
-        }
-        .stat-value {
-            font-size: 2.5rem;
-            font-weight: 700;
-            background: linear-gradient(135deg, #00d4ff, #7b68ee);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-        }
-        .stat-label { color: #888; font-size: 0.85rem; margin-top: 5px; }
-        .full-width { grid-column: 1 / -1; }
-        table { width: 100%; border-collapse: collapse; margin-top: 10px; }
-        th {
-            background: #0f0f23;
-            padding: 10px 15px;
-            text-align: left;
-            color: #00d4ff;
-            font-size: 0.85rem;
-            text-transform: uppercase;
-        }
-        td { padding: 10px 15px; border-bottom: 1px solid #ffffff08; font-size: 0.9rem; }
-        tr:hover { background: #ffffff05; }
-        .name-tag {
-            background: #7b68ee22;
-            color: #7b68ee;
-            padding: 3px 10px;
-            border-radius: 12px;
-            font-size: 0.85rem;
-        }
-        .time-tag { color: #00ff88; font-family: 'Courier New', monospace; }
-        .btn {
-            padding: 10px 20px;
-            border: none;
-            border-radius: 8px;
-            cursor: pointer;
-            font-weight: 600;
-            font-size: 0.9rem;
-            transition: all 0.2s;
-        }
-        .btn-primary {
-            background: linear-gradient(135deg, #00d4ff, #7b68ee);
-            color: white;
-        }
-        .btn-primary:hover { transform: translateY(-2px); box-shadow: 0 4px 15px #00d4ff33; }
-        .btn-danger { background: #ff4444; color: white; }
-        .actions { display: flex; gap: 10px; margin-top: 15px; }
-        .people-list { display: flex; flex-wrap: wrap; gap: 8px; }
-        .person-chip {
-            background: #00d4ff15;
-            border: 1px solid #00d4ff33;
-            color: #00d4ff;
-            padding: 6px 14px;
-            border-radius: 20px;
-            font-size: 0.85rem;
-        }
-        .mode-indicator {
-            padding: 4px 12px;
-            border-radius: 6px;
-            font-size: 0.8rem;
-            display: inline-block;
-        }
-        .mode-attend { background: #00ff8822; color: #00ff88; }
-        .mode-enroll { background: #7b68ee22; color: #7b68ee; }
-        @media (max-width: 768px) {
-            .container { grid-template-columns: 1fr; }
-        }
-    </style>
-</head>
-<body>
-    <div class="header">
-        <h1>📋 Smart Attendance Dashboard</h1>
-        <span id="statusBadge" class="status-badge status-online">● System Active</span>
-    </div>
-    <div class="container">
-        <div class="card">
-            <h3>👥 Registered People</h3>
-            <div class="stat-value" id="registeredCount">-</div>
-            <div class="stat-label">enrolled faces</div>
-        </div>
-        <div class="card">
-            <h3>📊 Total Records</h3>
-            <div class="stat-value" id="totalRecords">-</div>
-            <div class="stat-label">attendance entries</div>
-        </div>
-        <div class="card">
-            <h3>🎯 System Mode</h3>
-            <div class="stat-value" id="systemMode">-</div>
-            <div class="stat-label" id="cameraSource">-</div>
-        </div>
-
-        <div class="card full-width">
-            <h3>👤 Enrolled People</h3>
-            <div class="people-list" id="peopleList"></div>
-        </div>
-
-        <div class="card full-width">
-            <h3>📋 Recent Attendance</h3>
-            <table>
-                <thead>
-                    <tr><th>#</th><th>Name</th><th>Date</th><th>Time</th><th>Status</th></tr>
-                </thead>
-                <tbody id="attendanceTable"></tbody>
-            </table>
-        </div>
-    </div>
-
-    <script>
-        function updateDashboard() {
-            fetch('/api/status')
-                .then(r => r.json())
-                .then(data => {
-                    document.getElementById('registeredCount').textContent = data.people_registered;
-                    document.getElementById('totalRecords').textContent = data.total_attendance;
-                    document.getElementById('systemMode').textContent = data.mode;
-                    document.getElementById('cameraSource').textContent = data.camera_source;
-                });
-            fetch('/api/attendance')
-                .then(r => r.json())
-                .then(data => {
-                    const tbody = document.getElementById('attendanceTable');
-                    tbody.innerHTML = '';
-                    data.slice(-50).reverse().forEach((entry, i) => {
-                        tbody.innerHTML += `<tr>
-                            <td>${data.length - i}</td>
-                            <td><span class="name-tag">${entry.Name}</span></td>
-                            <td>${entry.Date}</td>
-                            <td class="time-tag">${entry.Time}</td>
-                            <td>${entry.Status}</td>
-                        </tr>`;
-                    });
-                });
-            fetch('/api/people')
-                .then(r => r.json())
-                .then(data => {
-                    const list = document.getElementById('peopleList');
-                    list.innerHTML = data.map(n => `<span class="person-chip">${n}</span>`).join('');
-                });
-        }
-        updateDashboard();
-        setInterval(updateDashboard, 3000);
-    </script>
-</body>
-</html>
-"""
-
 def start_flask():
     """Start Flask dashboard in a background thread."""
     if not FLASK_AVAILABLE:
@@ -773,34 +581,25 @@ def start_flask():
 
     @app.route('/')
     def dashboard():
-        return render_template_string(DASHBOARD_HTML)
+        return render_template('index.html')
 
     @app.route('/api/status')
     def api_status():
+        system_status['total_people'] = len(id_to_name)
         return jsonify(system_status)
 
     @app.route('/api/attendance')
     def api_attendance():
         return jsonify(attendance_log)
 
-    @app.route('/api/people')
-    def api_people():
-        return jsonify(list(id_to_name.values()))
-
     @app.route('/api/enroll', methods=['POST'])
     def api_enroll():
-        data = flask_request.get_json()
-        name = data.get('name', '').strip()
-        if not name:
-            return jsonify({'error': 'Name required'}), 400
-        # Run enrollment in a thread
-        threading.Thread(target=enroll_face, args=(name,), daemon=True).start()
-        return jsonify({'status': 'Enrollment started', 'name': name})
-
-    @app.route('/api/trigger_scan', methods=['POST'])
-    def api_trigger_scan():
-        # This will be picked up by the main loop
-        return jsonify({'status': 'Scan triggered'})
+        data = request.get_json() or {}
+        name = data.get('name')
+        if name:
+            enrollment_queue.put(name)
+            return jsonify({"status": "success", "message": f"Enrollment queued for {name}"})
+        return jsonify({"status": "error", "message": "Name missing"}), 400
 
     # Run Flask without debug output
     import logging
@@ -863,9 +662,27 @@ def main():
     scanning = False
 
     while True:
-        # ─── Check ESP32 serial messages ───
-        msg = read_esp32()
-        if msg:
+        # ─── Drain remote enrollment queue ───
+        while True:
+            try:
+                remote_enroll_name = enrollment_queue.get_nowait()
+                print(f"\n[DASHBOARD] Remote enrollment requested for: {remote_enroll_name}")
+                current_mode = 'ENROLLMENT'
+                system_status['mode'] = 'ENROLLMENT'
+                send_to_esp32("MODE_ENROLL")
+                enroll_face(remote_enroll_name)
+                current_mode = 'ATTENDANCE'
+                system_status['mode'] = 'ATTENDANCE'
+                send_to_esp32("MODE_ATTEND")
+            except queue.Empty:
+                break
+
+        # ─── Drain ESP32 serial messages ───
+        while True:
+            msg = read_esp32()
+            if not msg:
+                break
+            
             if msg == "MOTION_DETECTED" and current_mode == 'ATTENDANCE':
                 print("\n[PIR] Motion detected!")
                 scanning = True
@@ -873,8 +690,7 @@ def main():
                 current_mode = 'ENROLLMENT'
                 system_status['mode'] = 'ENROLLMENT'
                 print("\n[MODE] Switched to ENROLLMENT mode")
-                # Prompt for name on PC
-                print("Enter name for enrollment (or type 'cancel'):")
+                print("Enter name for enrollment (or type 'cancel'). You can also use Web Dashboard:")
                 name = input("> ").strip()
                 if name and name.lower() != 'cancel':
                     enroll_face(name)

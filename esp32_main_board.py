@@ -30,6 +30,8 @@ Serial protocol with PC (115200 baud):
     NO_FACES                              — No faces found
 """
 
+import _thread
+import machine
 from machine import Pin, PWM, SPI, SoftI2C
 import time
 import sys
@@ -495,6 +497,39 @@ if rtc_available:
 print("Waiting for motion / button press...")
 print("=" * 50 + "\n")
 
+# ─────────────────── INTERRUPT HANDLERS ───────────────────
+button_pressed_flag = False
+button_press_start_time = 0
+button_released_flag = False
+button_hold_duration = 0
+
+def btn_irq_handler(pin):
+    global button_pressed_flag, button_press_start_time, button_released_flag, button_hold_duration
+    current = time.ticks_ms()
+    if pin.value() == 0:  # Pressed (active low)
+        if not button_pressed_flag:
+            button_press_start_time = current
+            button_pressed_flag = True
+    else:  # Released
+        if button_pressed_flag:
+            button_hold_duration = time.ticks_diff(current, button_press_start_time)
+            button_released_flag = True
+            button_pressed_flag = False
+
+button.irq(trigger=machine.Pin.IRQ_FALLING | machine.Pin.IRQ_RISING, handler=btn_irq_handler)
+
+pir_triggered_flag = False
+last_pir_irq_time = 0
+
+def pir_irq_handler(pin):
+    global pir_triggered_flag, last_pir_irq_time
+    current = time.ticks_ms()
+    if time.ticks_diff(current, last_pir_irq_time) > 2000:
+        pir_triggered_flag = True
+        last_pir_irq_time = current
+
+pir.irq(trigger=machine.Pin.IRQ_RISING, handler=pir_irq_handler)
+
 
 # ─────────────────── MAIN LOOP ───────────────────
 
@@ -502,27 +537,13 @@ while True:
     current_ms = time.ticks_ms()
 
     # ─── 1. CHECK PUSH BUTTON ───
-    # The user says button isn't working. Button might be active HIGH instead of LOW.
-    # We will check for transition. If it was active LOW it would be 0 when pressed.
-    # Let's read the raw value
-    btn_val = button.value()
-    # If the button is wired from VCC to Pin, it will be 1 when pressed.
-    # If wired from GND to Pin, it will be 0 when pressed.
-    # Let's assume active LOW (0 = pressed) normally, but change it if active HIGH.
-    btn_pressed = (btn_val == 0)
+    if button_released_flag:
+        state = machine.disable_irq()
+        hold_duration = button_hold_duration
+        button_released_flag = False
+        machine.enable_irq(state)
 
-    if btn_pressed and not button_was_pressed:
-        # Button just pressed — record timestamp
-        button_press_time = current_ms
-        button_was_pressed = True
-        print("[DEBUG] Button pressed!")
-
-    elif not btn_pressed and button_was_pressed:
-        # Button released — check how long it was held
-        hold_duration = time.ticks_diff(current_ms, button_press_time)
-        button_was_pressed = False
         print(f"[DEBUG] Button released after {hold_duration}ms")
-
         if hold_duration >= LONG_PRESS_MS:
             # LONG PRESS → Toggle mode
             if current_mode == MODE_ATTENDANCE:
@@ -539,24 +560,22 @@ while True:
                 print("[MODE] Switched to ATTENDANCE mode")
             tft_show_idle(current_mode)
             idle_display_shown = True
-        else:
+        elif hold_duration > 50:  # Debounce minimum
             # SHORT PRESS → Manual trigger / confirm
             send_serial("BUTTON_PRESS")
             buzz_beep(1500, 50)
             print("[BUTTON] Short press")
 
     # ─── 2. CHECK PIR SENSOR ───
-    # User says PIR is not triggering. PIR sensors output HIGH (1) when motion is detected,
-    # but they can take a few seconds to fall back to LOW.
     if current_mode == MODE_ATTENDANCE:
-        motion = pir.value()
+        if pir_triggered_flag:
+            state = machine.disable_irq()
+            pir_triggered_flag = False
+            machine.enable_irq(state)
 
-        if motion == 1 and not motion_active:
             elapsed = time.ticks_diff(current_ms, last_pir_time)
-            # Make the cooldown check less strict for debugging
             if elapsed > (PIR_COOLDOWN * 1000) or last_pir_time == 0:
-                print(f"[DEBUG] PIR rising edge detected!")
-                # Motion detected!
+                print(f"[DEBUG] PIR rising edge detected via IRQ!")
                 last_pir_time = current_ms
                 motion_active = True
 
@@ -573,7 +592,7 @@ while True:
 
                 print(f"[PIR] Motion detected at {ts}")
 
-        elif motion == 0 and motion_active:
+        elif pir.value() == 0 and motion_active:
             # PIR pin went back to 0
             motion_active = False
             print("[DEBUG] PIR sensor reset to 0")

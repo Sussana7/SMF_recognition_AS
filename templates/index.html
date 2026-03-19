@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Smart Attendance Dashboard</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+    <style>
+        body { background-color: #0f172a; color: #f8fafc; font-family: 'Inter', sans-serif; }
+        .glass-panel { background: rgba(30, 41, 59, 0.7); backdrop-filter: blur(10px); border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 1rem; }
+        .glow { box-shadow: 0 0 15px rgba(56, 189, 248, 0.3); }
+        .spinner { border: 3px solid rgba(255,255,255,0.1); border-radius: 50%; border-top: 3px solid #38bdf8; width: 20px; height: 20px; animation: spin 1s linear infinite; }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+    </style>
+</head>
+<body class="min-h-screen p-6">
+    <div class="max-w-6xl mx-auto">
+        <!-- Header -->
+        <header class="flex justify-between items-center mb-8">
+            <h1 class="text-3xl font-bold text-transparent bg-clip-text bg-gradient-to-r from-sky-400 to-blue-600">
+                <i class="fas fa-users-viewfinder mr-3 text-sky-400"></i>Smart Attendance System
+            </h1>
+            <div id="connectionStatus" class="flex items-center space-x-2 text-sm">
+                <div class="w-3 h-3 rounded-full bg-emerald-500 glow animate-pulse"></div>
+                <span class="text-emerald-400 font-medium">System Online</span>
+            </div>
+        </header>
+
+        <!-- Stats Grid -->
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
+            <div class="glass-panel p-6 flex items-center">
+                <div class="p-4 bg-blue-500/20 rounded-lg text-blue-400 mr-4">
+                    <i class="fas fa-clock text-2xl"></i>
+                </div>
+                <div>
+                    <p class="text-slate-400 text-sm font-medium uppercase tracking-wider">Current Mode</p>
+                    <p id="systemMode" class="text-2xl font-bold tracking-tight">ATTENDANCE</p>
+                </div>
+            </div>
+            <div class="glass-panel p-6 flex items-center">
+                <div class="p-4 bg-purple-500/20 rounded-lg text-purple-400 mr-4">
+                    <i class="fas fa-id-badge text-2xl"></i>
+                </div>
+                <div>
+                    <p class="text-slate-400 text-sm font-medium uppercase tracking-wider">Registered Profiles</p>
+                    <p id="totalProfiles" class="text-2xl font-bold tracking-tight">0</p>
+                </div>
+            </div>
+            <div class="glass-panel p-6 flex items-center">
+                <div class="p-4 bg-emerald-500/20 rounded-lg text-emerald-400 mr-4">
+                    <i class="fas fa-clipboard-check text-2xl"></i>
+                </div>
+                <div>
+                    <p class="text-slate-400 text-sm font-medium uppercase tracking-wider">Total Logs</p>
+                    <p id="totalLogs" class="text-2xl font-bold tracking-tight">0</p>
+                </div>
+            </div>
+        </div>
+
+        <!-- Main Content -->
+        <div class="grid grid-cols-1 lg:grid-cols-3 gap-8">
+            <!-- Attendance Log Table -->
+            <div class="lg:col-span-2 glass-panel p-6">
+                <div class="flex justify-between items-center mb-6">
+                    <h2 class="text-xl font-bold text-slate-100">Live Attendance Log</h2>
+                    <button onclick="fetchData()" class="text-slate-400 hover:text-white transition-colors">
+                        <i class="fas fa-sync-alt"></i> Refresh
+                    </button>
+                </div>
+                <div class="overflow-x-auto">
+                    <table class="w-full text-left">
+                        <thead>
+                            <tr class="text-slate-400 border-b border-slate-700 text-sm uppercase tracking-wider">
+                                <th class="pb-3 pl-2">Name</th>
+                                <th class="pb-3">Date</th>
+                                <th class="pb-3">Time</th>
+                                <th class="pb-3">Status</th>
+                            </tr>
+                        </thead>
+                        <tbody id="attendanceTable" class="text-sm font-medium">
+                            <!-- Populated by JS -->
+                            <tr><td colspan="4" class="text-center py-8 text-slate-500">Loading logs...</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- Controls Panel -->
+            <div class="glass-panel p-6">
+                <h2 class="text-xl font-bold text-slate-100 mb-6 border-b border-slate-700 pb-2">Admin Controls</h2>
+                
+                <div class="bg-slate-800/50 rounded-lg p-5 border border-slate-700">
+                    <h3 class="font-semibold text-lg mb-2 text-sky-400">Remote Enrollment</h3>
+                    <p class="text-sm text-slate-400 mb-4">Add a new person to the facial recognition system using the ESP32 camera.</p>
+                    
+                    <div id="enrollForm">
+                        <input type="text" id="enrollName" placeholder="Enter Full Name" class="w-full bg-slate-900 border border-slate-700 rounded-md px-4 py-2 text-white focus:outline-none focus:border-sky-500 focus:ring-1 focus:ring-sky-500 mb-4 transition-all" autocomplete="off">
+                        <button onclick="startEnrollment()" class="w-full bg-gradient-to-r from-sky-500 to-blue-600 hover:from-sky-400 hover:to-blue-500 text-white font-medium py-2 px-4 rounded-md shadow-lg shadow-blue-500/30 transition-all flex justify-center items-center">
+                            <i class="fas fa-user-plus mr-2"></i> Start Face Scan
+                        </button>
+                    </div>
+                    
+                    <div id="enrollStatus" class="hidden mt-4 p-3 rounded-md bg-blue-900/40 border border-blue-700 text-sm text-blue-200">
+                        <div class="flex items-center">
+                            <div class="spinner mr-3"></div>
+                            <span>Scanning 20 frames... Please look at the camera.</span>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="mt-6 pt-6 border-t border-slate-700">
+                    <h3 class="font-semibold text-sm text-slate-400 mb-3 uppercase tracking-wider">System Status</h3>
+                    <div class="space-y-2 text-sm">
+                        <div class="flex justify-between"><span class="text-slate-500">Camera:</span> <span id="sysCamera" class="font-medium">Connecting...</span></div>
+                        <div class="flex justify-between"><span class="text-slate-500">Hardware:</span> <span id="sysHardware" class="font-medium text-emerald-400">Active</span></div>
+                        <div class="flex justify-between"><span class="text-slate-500">Last Scan:</span> <span id="sysLastScan" class="font-medium">-</span></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        async function fetchData() {
+            try {
+                // Fetch status
+                const statusRes = await fetch('/api/status');
+                const status = await statusRes.json();
+                
+                document.getElementById('systemMode').innerText = status.mode;
+                document.getElementById('totalProfiles').innerText = status.total_people;
+                document.getElementById('totalLogs').innerText = status.total_attendance;
+                document.getElementById('sysCamera').innerText = status.camera_source;
+                document.getElementById('sysLastScan').innerText = status.last_scan || 'None';
+
+                // Fetch attendance
+                const attRes = await fetch('/api/attendance');
+                const logs = await attRes.json();
+                
+                let html = '';
+                if(logs.length === 0) {
+                    html = '<tr><td colspan="4" class="text-center py-8 text-slate-500">No attendance records found.</td></tr>';
+                } else {
+                    // Reverse to show newest first
+                    logs.reverse().forEach(log => {
+                        html += `
+                        <tr class="border-b border-slate-800/50 hover:bg-slate-800/30 transition-colors">
+                            <td class="py-3 pl-2 text-sky-100 font-medium">${log.Name || 'Unknown'}</td>
+                            <td class="py-3 text-slate-400">${log.Date || '-'}</td>
+                            <td class="py-3 text-slate-400">${log.Time || '-'}</td>
+                            <td class="py-3"><span class="bg-emerald-500/20 text-emerald-400 px-2 py-1 rounded-md text-xs font-bold uppercase">${log.Status || 'Present'}</span></td>
+                        </tr>`;
+                    });
+                }
+                document.getElementById('attendanceTable').innerHTML = html;
+            } catch (err) {
+                console.error("Error fetching data:", err);
+            }
+        }
+
+        async function startEnrollment() {
+            const nameInput = document.getElementById('enrollName');
+            const name = nameInput.value.trim();
+            
+            if(!name) {
+                alert("Please enter a name first.");
+                return;
+            }
+
+            document.getElementById('enrollForm').classList.add('hidden');
+            document.getElementById('enrollStatus').classList.remove('hidden');
+
+            try {
+                const res = await fetch('/api/enroll', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ name: name })
+                });
+                const data = await res.json();
+                
+                if(data.status === 'success') {
+                    // Poll waiting for mode to return to ATTENDANCE
+                    const checkInterval = setInterval(async () => {
+                        const statusRes = await fetch('/api/status');
+                        const status = await statusRes.json();
+                        if(status.mode === 'ATTENDANCE') {
+                            clearInterval(checkInterval);
+                            alert(`Success! ${name} has been enrolled.`);
+                            document.getElementById('enrollForm').classList.remove('hidden');
+                            document.getElementById('enrollStatus').classList.add('hidden');
+                            nameInput.value = '';
+                            fetchData();
+                        }
+                    }, 2000);
+                }
+            } catch (err) {
+                alert("Error starting enrollment");
+                console.error(err);
+                document.getElementById('enrollForm').classList.remove('hidden');
+                document.getElementById('enrollStatus').classList.add('hidden');
+            }
+        }
+
+        // Auto refresh every 3 seconds
+        fetchData();
+        setInterval(fetchData, 3000);
+    </script>
+</body>
+</html>

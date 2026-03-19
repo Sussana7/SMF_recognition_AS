@@ -7,7 +7,15 @@ A comprehensive, edge-to-cloud IoT attendance tracking system using ESP32 microc
 - **Hardware Integration**: ESP32 main board equipped with a PIR sensor, Push Button, TFT display (ST7735), Buzzer, and RGB LED for physical interactions and status updates.
 - **ESP32-CAM Video Stream**: Uses a dedicated ESP32-CAM module to securely stream JPEG frames over Wi-Fi to a PC server for heavy processing.
 - **Live Web Dashboard**: A responsive, real-time dashboard built with Flask and TailwindCSS that allows administrators to view logs, monitor system status, and trigger remote enrollments directly from a web browser.
-- **Automated Fallback**: The system automatically gracefully degrades to use the **PC's internal webcam** if the ESP32-CAM is unavailable or encounters Wi-Fi issues.
+## Testing with Hardware (For Examiners)
+To properly test the physical ESP32 camera without the original developer's home Wi-Fi network, the codebase expects a standardized mobile hotspot:
+
+1. On your smartphone (or PC), turn on your **Mobile Hotspot**.
+2. Set the Hotspot network name (SSID) to exactly: `Project_Testing`
+3. Set the Hotspot password to exactly: `12345678`
+4. Plug in the ESP32-CAM. Within 15 seconds, it will automatically connect to your hotspot.
+5. Find the ESP32-CAM's IP address (visible on the hotspot connected devices screen).
+6. Open `pc_server.py`, change `ESP32_CAM_URL = "http://YOUR_IP_HERE/capture"`, and run `python pc_server.py`.
 
 ## Testing & Evaluation without Hardware (For Examiners)
 The project is built to ensure a flawless software evaluation even if the physical hardware is disconnected or unavailable.

@@ -8,9 +8,11 @@ A comprehensive, edge-to-cloud IoT attendance tracking system using ESP32 microc
 - **ESP32-CAM Video Stream**: Uses a dedicated ESP32-CAM module to securely stream JPEG frames over Wi-Fi to a PC server for heavy processing.
 - **Live Web Dashboard**: A responsive, real-time dashboard built with Flask and TailwindCSS that allows administrators to view logs, monitor system status, and trigger remote enrollments directly from a web browser.
 ## Testing with Hardware (For Examiners)
-To properly test the physical ESP32 camera without the original developer's home Wi-Fi network, the codebase expects a standardized mobile hotspot:
+**CRITICAL CONNECTIVITY NOTE:** The ESP32-CAM hardware *only* supports the **2.4 GHz Wi-Fi band**. It cannot connect to 5 GHz networks. Furthermore, iPhone Mobile Hotspots frequently use WPA3 or client isolation which blocks the ESP32. **Please use an Android smartphone or a Windows PC Mobile Hotspot set explicitly to the 2.4 GHz band.**
 
-1. On your smartphone (or PC), turn on your **Mobile Hotspot**.
+To test the physical ESP32 camera without the original developer's home Wi-Fi network, the codebase expects a standardized mobile hotspot:
+
+1. On your Android smartphone or Windows PC, turn on your **Mobile Hotspot** (ensure it is set to **2.4 GHz**).
 2. Set the Hotspot network name (SSID) to exactly: `Project_Testing`
 3. Set the Hotspot password to exactly: `12345678`
 4. Plug in the ESP32-CAM. Within 15 seconds, it will automatically connect to your hotspot.
